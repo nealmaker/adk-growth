@@ -7,7 +7,7 @@ output:
     fig_caption: TRUE
     df_print: kable
   
-bibliography: ["C:/Users/Neal/bibtex-db/citations.bib"]
+bibliography: ["adk-growth-bib.bib"]
 ---
 
 ```{r, setup, include=FALSE}

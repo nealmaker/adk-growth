@@ -1,0 +1,770 @@
+---
+title: "An Emperical Diameter Growth Model for Trees in the Adirondacks"
+author: "Neal Maker"
+date: "May 28, 2019"
+output: 
+  pdf_document:
+    fig_caption: TRUE
+    df_print: kable
+  
+bibliography: ["C:/Users/Neal/bibtex-db/citations.bib"]
+---
+
+```{r, setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, error = FALSE, warning = FALSE, message = FALSE)
+```
+
+#Introduction
+
+The principal goal of this analysis was develop a diameter growth model for trees in New York state's Adirondack region, which can be incorporated into Pekin Branch Forestry's^[www.pekinbranch.com] forest inventory, analysis and planning toolbox. The model will be used to predict the growth of existing forest stands to aid in management planning. 
+
+An individual tree model (which predicts growth for individual trees rather than on a per area basis) will be most useful. Many forests in the Northeast have been affected by multiple disturbances of varying intensity (opportunistic logging chief among them) and are now irregularly structured and compositionally diverse [@teck_individual_1991]. Management schemes focused on growing high quality logs must be responsive to these variations; and individual tree models do a better job accounting for such heterogeneity than stand-level models, which are better suited to even-aged, monospecific stands [@peng_growth_2000]. 
+
+Distance-dependent modeling can help address heterogeneity too, by accounting for the spatial relationships between individual trees to more accurately estimate competition between them. The cost of obtaining geographic information for individual trees is still high, though, and a distance-independent model will be easier to use with existing forest inventory data. Also, competition indicies can be obtained from conventional (non-spatial) inventory techniques, and in many cases they can be used to derive growth estimates with accuracies comparable to those derived from spatially-explicit competition indicies [@kuehne_comparing_2019].
+
+A number of distance-independent, individual tree diameter growth models have been developed for use in forest management planning in the Northeast. @teck_individual_1991 used data from 14 Northeastern states to predict the potential diameter growth for separate species, based on tree diameter at breast height (dbh) and a measure of site class (aka productivity). Overtopping basal area (a measure of competition for individual trees) was then used to modify potential growth downward and obtain actual growth predictions. These species-specific models were incorporated into the NE-Twigs and FVS forest growth simulators. They are applicable to a wide geographic area, but lack the accuracy of models with narrower focus. 
+
+@westfall_predicting_2006 used a similarly broad geographic extent, but employed a mixed-effects model, which allowed different species to be modeled together, overcoming sample size limitations common to species-specific models. A greater number of predictors were used, which included crown ratio (the percent of a tree's height with a live crown), basal area (a measure of forest stocking) latitude, longitude, and elevation.
+
+@weiskittel_development_2016 [see also @weiskittel_correction_2019] recognized that these broad-area models are biased in the Adirondacks, and developed a more targeted model based on data from five experimental forests in the region. Theirs is also a mixed-effects model, with model coefficients varying by species. Like Teck and Hilt, they used only four predictors: species, dbh, overtopping basal area, and site class.
+
+This analysis was conducted to further increase the accuracy of diameter growth predictions for the Adirondacks, by making  full use of the potential predictor variables available, by better accounting for the interactions that occur between predictors, and by taking advantage of the large Forest Inventory and Analysis (FIA) dataset that is available for the region.
+
+#Data & Analysis
+
+FIA data are collected by the US Forest Service across the country and across ownerships. Data are collected from permanent plots, which are periodically reinventoried so that changes to the country's forests can be observed. They are stored in a publicly available relational database^[https://www.fia.fs.fed.us/] that includes information about site characteristics, individual trees, and growth rates. This analysis was carried out within the statistical computing environment R^[The R Foundation: https://www.r-project.org/] and FIA data were obtained using the laselva tool that was developed for R by @chamberlain_laselva:_2018.
+
+```{r, import_fia}
+
+# Checks for, installs, & loads packages (no warning prior to install):
+using <- function(...) {
+  libs <- unlist(list(...))
+  req <- unlist(lapply(libs, require, character.only = TRUE))
+  need <- libs[req == FALSE]
+  if(length(need) > 0){ 
+    install.packages(need)
+    lapply(need, require, character.only = TRUE)
+  }
+}
+
+using("tidyverse", "laselva", "maps", "caret", "Rborist", "extrafont", "knitr")
+# laselva fetches FIA data: https://github.com/ropenscilabs/laselva
+loadfonts("win", quiet = TRUE)
+
+
+
+##############################
+# Import FIA data
+##############################
+
+
+# Define NY counties (FIPS codes) in Adirondack region --------
+
+counties <- c(75, 65, 49, 45, 89, 43, 35, 41, 33, 31, 19, 113)
+
+
+# Fetch FIA tree, growth, plot, & condition data for New York 
+# (this may take a few minutes)
+
+ny_trees <- fia_fetch(state = "NY")
+ny_growth <- fia_fetch("NY", "TREE_GRM_COMPONENT")
+ny_plots <- fia_fetch("NY", "PLOT")
+ny_conds <- fia_fetch("NY", "COND")
+
+
+# Filter nf_trees to keep only data from Adirondack counties 
+
+adk_trees <- ny_trees$NY_tree %>%
+  filter(COUNTYCD %in% counties)
+
+
+# Calculates overtopping basal area (BAL) assuming all input trees are in same plot
+# and ba is adjusted based on tpa:
+# THIS IS A REMNANT FROM AN ATTEMPT THAT WAS DISCARDED!
+pbal <- function(dbh, ba){
+  sapply(dbh, function(x){
+    index <- dbh > x
+    return(sum(ba[index]))
+  })
+}
+
+
+# For each FIA table, filter, format and select vectors that might be useful
+adk_trees <- adk_trees %>%
+  # keep live, non-cull, non-seedling trees:
+  filter(DIAHTCD == 1, 
+         TREECLCD == 2, 
+         STATUSCD == 1) %>% 
+  mutate(TRE_CN = CN,
+         SPCD = factor(SPCD),
+         COUNTY = factor(COUNTYCD)) %>%
+  select(TRE_CN, PLT_CN, COUNTY, SPCD, HT, CCLCD, TREEGRCD, CULL, UNCRCD, 
+         CR, CDENCD, CDIEBKCD, TRANSCD, TREECLCD_NERS, DAMLOC1, DAMLOC2, 
+         DAMTYP1, DAMTYP2, DAMSEV1, DAMSEV2, INVYR, DIA)
+
+ny_growth <- ny_growth$NY_TREE_GRM_COMPONENT %>%
+  select(TRE_CN, DIA_BEGIN, DIA_MIDPT, DIA_END, ANN_DIA_GROWTH) 
+
+ny_plots <- ny_plots$NY_PLOT %>%
+  mutate(PLT_CN = CN) %>%
+  select(PLT_CN, LAT, LON)
+
+ny_conds <- ny_conds$NY_COND %>%
+  select(FORTYPCD, SITECLCD, SLOPE, ASPECT, PHYSCLCD, GSSTKCD,
+         BALIVE, LIVE_CANOPY_CVR_PCT, NBR_LIVE_STEMS, PLT_CN)
+
+
+# Join FIA tables -------------------------------------------------------
+
+adk_fia <- inner_join(adk_trees, ny_growth, by = "TRE_CN") 
+
+adk_fia <- right_join(ny_plots, adk_fia, by = "PLT_CN")
+
+adk_fia <- right_join(ny_conds, adk_fia, by = "PLT_CN")
+
+
+# filter out observations w/o diameter growth measurements (response variable),
+# remove database key, bring response to front
+
+adk_fia <- adk_fia %>% filter(!is.na(ANN_DIA_GROWTH)) %>%
+  select(-(TRE_CN)) %>% 
+  select(ANN_DIA_GROWTH, everything())
+
+
+# clean up ---------------------------------------------------------------
+
+remove(adk_trees, ny_conds, ny_growth, ny_plots, ny_trees, counties, 
+       pbal, using)
+
+n_trees1 <- nrow(adk_fia)
+n_plots1 <- length(unique(adk_fia$PLT_CN))
+n_spp1 <- length(unique(adk_fia$SPCD))
+```
+
+```{r preprocess}
+
+##############################
+# Preprocess
+##############################
+
+
+# Examine vectors ----------------------------------------------------------
+
+# str(adk_fia)
+# 
+# summary(adk_fia)
+# 
+# adk_fia <- adk_fia %>%
+#   arrange(ANN_DIA_GROWTH)
+# 
+# View(head(adk_fia))
+# 
+# View(tail(adk_fia))
+# 
+# levels(adk_fia$COUNTY) # 12 NY counties: all accounted for
+# 
+# 
+# # Distribution of growth rates -------------------------------------------
+# 
+# adk_fia %>%
+#   group_by(SPCD) %>%
+#   filter(n()>=20) %>%
+#   ungroup() %>%
+#   ggplot(aes(ANN_DIA_GROWTH)) +
+#   geom_density(bw = .008, fill = "dark gray") +
+#   geom_vline(xintercept = median(adk_fia$ANN_DIA_GROWTH),
+#              col = "dark green", size = 1)
+# 
+# adk_fia %>% ggplot(aes(sample = ANN_DIA_GROWTH)) + geom_qq()
+# 
+# # Grouped by species:
+# adk_fia %>%
+#   group_by(SPCD) %>%
+#   filter(n()>=20) %>%
+#   ungroup() %>%
+#   ggplot(aes(ANN_DIA_GROWTH)) +
+#   geom_density(bw = .008, fill = "dark gray") +
+#   geom_vline(xintercept = median(adk_fia$ANN_DIA_GROWTH),
+#              col = "dark green", size = 1) +
+#   facet_wrap(~ SPCD, ncol = 5)
+# 
+# 
+# # Look for plots w/o condition data --------------------------------------
+# 
+# View(adk_fia %>%
+#        filter(is.na(FORTYPCD)) %>%
+#        group_by(PLT_CN) %>%
+#        summarize(nasite = sum(is.na(SITECLCD))/n(),
+#                  naslope = sum(is.na(SLOPE))/n(),
+#                  naaspect = sum(is.na(ASPECT))/n(),
+#                  naphys = sum(is.na(PHYSCLCD))/n(),
+#                  nastock = sum(is.na(GSSTKCD))/n(),
+#                  naba = sum(is.na(BALIVE))/n()))
+# 
+# View(adk_fia %>%
+#        filter(!is.na(FORTYPCD)) %>%
+#        group_by(PLT_CN) %>%
+#        summarize(nasite = sum(is.na(SITECLCD))/n(),
+#                  naslope = sum(is.na(SLOPE))/n(),
+#                  naaspect = sum(is.na(ASPECT))/n(),
+#                  naphys = sum(is.na(PHYSCLCD))/n(),
+#                  nastock = sum(is.na(GSSTKCD))/n(),
+#                  naba = sum(is.na(BALIVE))/n()))
+# 
+# View(unique((adk_fia %>% filter(is.na(FORTYPCD)))$COUNTY))
+# # Plots w/o condition data exist in all counties
+
+
+# Fix problems -------------------------------------------------------------
+
+bad_plots <- unique((filter(adk_fia, is.na(FORTYPCD)))$PLT_CN) #w/o condition data
+n_plots2 <- n_plots1 - length(bad_plots)
+
+adk_fia <- adk_fia  %>%
+  # reformat factors:
+  mutate(FORTYPCD = factor(FORTYPCD),
+         PHYSCLCD = factor(PHYSCLCD)) %>%
+  # remove observations missing key predictors:
+  filter(#!is.na(bal),
+         !(PLT_CN %in% bad_plots)) %>%
+  # remove empty & almost empty vectors:
+  select(ANN_DIA_GROWTH:BALIVE, LAT:SPCD, CCLCD, CR, INVYR, DIA_MIDPT)
+
+n_spp2 <- length(unique(adk_fia$SPCD))
+
+# Make names and factor levels match PBF inventory input -------------------
+
+species_codes <- c(12, 43, 68, 70, 71, 91, 94, 95, 96, 97, 105, 123, 125, 126, 129, 
+                   130, 136, 202, 221, 241, 261, 310, 313, 314, 315, 316, 317, 318, 
+                   319, 320, 331, 341, 355, 356, 357, 367, 370, 371, 372, 373, 375, 
+                   379, 391, 400, 402, 403, 407, 409, 421, 462, 491, 500, 531, 540, 
+                   541, 543, 544, 546, 552, 601, 602, 621, 651, 655, 660, 661, 663, 
+                   680, 693, 701, 712, 731, 741, 742, 743, 744, 746, 760, 761, 762, 
+                   763, 764, 771, 802, 804, 806, 816, 823, 832, 833, 837, 901, 920, 
+                   922, 923, 926, 934, 935, 936, 937, 950, 951, 970, 972, 975, 977, 
+                   999)
+
+species <- c("fir", "other softwood", "cedar", "tamarack", "tamarack", 
+             "norway spruce", "spruce", "spruce", "spruce", "spruce", "other softwood", 
+             "other softwood", "red pine", "other softwood", "white pine", "scots pine", 
+             "other softwood", "other softwood", "other softwood", "cedar", "hemlock", 
+             "other hardwood", "soft maple", "hard maple", "striped maple", "soft maple",
+             "soft maple", "hard maple", "other hardwood", "hard maple", 
+             "other hardwood", "other hardwood", "other hardwood", "other hardwood", 
+             "other hardwood", "other hardwood", "other hardwood", "yellow birch", 
+             "other hardwood", "other hardwood", "paper birch", "other hardwood", 
+             "other hardwood", "hickory", "hickory", "hickory", "hickory", "hickory", 
+             "other hardwood", "other hardwood", "other hardwood", "other hardwood", 
+             "beech", "ash", "ash", "ash", "ash", "ash", "other hardwood", "butternut", 
+             "other hardwood", "other hardwood", "other hardwood", "other hardwood", 
+             "other hardwood", "other hardwood", "other hardwood", "other hardwood", 
+             "other hardwood", "hophornbeam", "other hardwood", "other hardwood", 
+             "aspen", "cottonwood", "aspen", "cottonwood", "aspen", "other hardwood", 
+             "other hardwood", "black cherry", "other hardwood", "other hardwood", 
+             "other hardwood", "white oak", "white oak", "red oak", "white oak", 
+             "white oak", "white oak", "red oak", "red oak", "other hardwood", 
+             "other hardwood", "other hardwood", "other hardwood", "other hardwood", 
+             "other hardwood", "other hardwood", "other hardwood", "other hardwood", 
+             "basswood", "basswood", "elm", "elm", "elm", "elm", "other hardwood")
+
+spp <- data.frame(SPCD = factor(species_codes), spp = species)
+
+adk_fia <- left_join(adk_fia, spp, by = "SPCD")
+
+
+forest_type_codes <- c(101, 102, 103, 104, 105, 121, 122, 123, 124, 125, 126, 127, 
+                       167, 171, 381, 384, 385, 401, 402, 409, 503, 505, 509, 512, 
+                       513, 516, 517, 519, 520, 701, 702, 703, 704, 705, 706, 707, 
+                       708, 709, 801, 802, 805, 809, 901, 902, 903, 904, 905, 962, 
+                       995, 999)
+
+forest_types <- c("Red pine", "Red pine", "White pine", "Mixed softwood", "Hemlock",
+                  "Spruce-fir", "Spruce-fir", "Spruce-fir", "Spruce-fir", "Spruce-fir",
+                  "Larch", "Cedar", "Mixed softwood", "Mixed softwood", "Scots pine", 
+                  "Norway spruce", "Larch", "Pine-hardwood", "Mixedwood",
+                  "Pine-hardwood", "Oak-hickory", "Oak-hickory", "Oak-hickory", 
+                  "Transition hardwood", "Transition hardwood", "Transition hardwood", 
+                  "Transition hardwood", "Northern hardwood", "Northern hardwood", 
+                  "Northern hardwood", "Transition hardwood", "Cottonwood", "Other", 
+                  "Other", "Other", "Northern hardwood", "Northern hardwood", 
+                  "Cottonwood", "Northern hardwood", "Northern hardwood", 
+                  "Northern hardwood", "Northern hardwood", "Northern hardwood", 
+                  "Northern hardwood", "Northern hardwood", "Northern hardwood", 
+                  "Northern hardwood", "Other", "Other", "Nonstocked")
+
+forests <- data.frame(FORTYPCD = factor(forest_type_codes), forest_type = forest_types)
+
+adk_fia <- left_join(adk_fia, forests, by = "FORTYPCD")
+
+
+landscape_codes <- c(11, 12, 13, 21, 22, 23, 24, 25, 29, 31, 32, 34, 39)
+
+landscapes <- c("dry tops", "dry slopes", "deep sands", "flatwoods", "rolling uplands",
+                "moist slopes & coves", "narrow floodplains/bottomlands",
+                "broad floodplains/bottomlands", "other mesic", "swamps/bogs", 
+                "small drains", "beaver ponds", "other hydric")
+
+lands <- data.frame(PHYSCLCD = factor(landscape_codes), landscape = landscapes)
+
+adk_fia <- left_join(adk_fia, lands, by = "PHYSCLCD")
+
+remove(forests, lands, spp, bad_plots, forest_type_codes, forest_types, landscape_codes,
+       landscapes, species, species_codes)
+
+
+# Rename variables ---------------------------------------------------------
+
+adk_fia <- adk_fia %>%
+  mutate(stocking = GSSTKCD, crown_class = CCLCD)
+
+adk_fia <- adk_fia %>%
+  select(-SPCD, -FORTYPCD, -PHYSCLCD, -GSSTKCD, -CCLCD, -INVYR) %>%
+  rename(diam_growth = ANN_DIA_GROWTH, site_class = SITECLCD, slope = SLOPE, 
+         aspect = ASPECT, ba = BALIVE, lat = LAT, lon = LON, county = COUNTY, 
+         cr = CR, dbh = DIA_MIDPT)
+
+n_trees2 <- nrow(adk_fia)
+n_spp3 <- length(unique(adk_fia$spp))
+```
+
+In the Adirondacks, FIA data include diameter growth rates for `r prettyNum(n_trees1, big.mark = ",")` individual trees, measured on a total of `r prettyNum(n_plots1, big.mark = ",")` plots.  A number of plots lack condition data, however, including key predictive variables like site class, stand stocking, and forest type. Data from these plots were removed from the analysis, and a total of `r prettyNum(n_trees2, big.mark = ",")` observations were retained, representing `r n_spp2` unique species, collected from `r prettyNum(n_plots2, big.mark = ",")` different plots. The remaining plots are uniformly distributed across every Adirondack county. For comparison, @weiskittel_development_2016 used 25,438 diameter growth observations from 577 total plots on five different properties.
+
+```{r partition}
+##############################
+# Partition data
+##############################
+
+test_size <- .2
+
+set.seed(10)
+index <- createDataPartition(adk_fia$diam_growth, times = 1, p = test_size, list = FALSE)
+
+train <- adk_fia[-index,]
+test <- adk_fia[index,]
+```
+
+Several changes were made to the data to make them compatible with Pekin Branch Forestry's inventory protocols. Species were grouped into functional categories (combining some species within genera and grouping uncommon species and species without commercial value) and forest types were recombined to match Pekin Branch's categorization scheme. In the reformatted dataset, trees are grouped into `r n_spp3` species groups and `r length(levels(adk_fia$forest_type))` forest types.
+
+Factors used as predictors in the final model include site-specific variables (site class, slope, aspect, latitude, longitude, landscape position, forest type, forest stocking, and basal area) and tree-specific variables (species, dbh, crown class, and crown ratio). Site class is a discrete ordinal measure of the site's inherent productivity. Landscape position is a categorical factor that classifies sites according to various site and soil conditions and moisture regimes; with levels that include "deep sands", "dry tops", "moist slopes & coves", and "flatwoods", among others. Forest type is defined by the species composition of the current forest on a site. And crown class is a discrete ordinal measure of a tree's access to light, ranging from "open grown", to "overtopped".  
+
+Once the data was cleaned and pre-processed, and the variables of interest identified, a random subset of `r test_size*100`% of the observations was reserved for testing the final growth model. The remaining `r 100-(test_size*100)`% was used for exploratory analysis and model training.
+
+##Exploratory Analysis
+
+Diameter growth rates in the region range from `r min(train$diam_growth)` to `r round(max(train$diam_growth),2)` inches per year, measured at breast height (4.5 feet above the ground), with a mean growth rate of `r round(mean(train$diam_growth),3)` inches per year. Growth rates above 0.3 inches per year are very uncommon, and are almost all from white pine trees with crown ratios greater than 50%.
+
+As has been demonstrated in previous studies [@teck_individual_1991; @pacala_forest_1996; @lessard_diameter_2000; @bragg_optimal_2005; @weiskittel_development_2016], diameter growth is highly correlated to dbh, with distinct growth curves for individual species (figure \ref{fig:dbhCurves}). Cottonwood, white pine, and red oak have the highest growth rates overall, and norway spruce has the lowest (table 1).
+
+```{r dbhCurves, fig.cap="\\label{fig:dbhCurves}Diameter growth trends for common species groups, smoothed using generalized addative models. Shaded regions show 95% confidance intervals.", fig.height=3}
+
+train %>%
+  filter(spp != "fir") %>%
+  group_by(spp) %>%
+  filter(n() > 2000) %>%
+  ungroup() %>%
+  mutate(spp = reorder(spp, -diam_growth, FUN = mean)) %>%
+  ggplot(aes(dbh, diam_growth, col = spp)) +
+  geom_smooth(method.args = list(gamma =4)) +
+  scale_y_continuous(name = expression(Delta~'dbh (in/yr)')) + 
+  xlab("dbh (in)") +
+  scale_color_brewer(type = "qual",
+                     name = "species group") +
+  theme(text = element_text(family = "Perpetua"))
+```
+
+Factors that account for competition between trees are correlated with diameter growth as well. Crown ratio looks to have the clearest relationship (figure \ref{fig:crGraph}), with growth increasing at a decreasing rate as crown ratios rise. Plot level stocking (which depends on the forest type) also shows a slight correlation to growth, with slower growing trees in more densely stocked areas (figure \ref{fig:stockGraph}). Growth seems to slow again slightly in nonstocked plot areas; probably because they include poorer sites that do not support the growth of closed canopy forests.
+
+\pagebreak
+
+```{r, sppRates, results="asis"}
+
+spp_rates <- train %>%
+                mutate(spp = reorder(spp, -diam_growth, FUN = mean))%>%
+                group_by(spp) %>%
+                summarize(n = n(),
+                         mean_growth = mean(diam_growth),
+                         sd_growth = sd(diam_growth))
+
+blank <- data.frame(x = rep("", 13))
+
+kable(cbind(spp_rates[1:13,], blank, spp_rates[14:26,]), 
+      digits = 3,
+      col.names = c("species group", "n", "$\\Delta$dbh", "sd", "  ",
+                    "species group", "n", "$\\Delta$dbh", "sd"),
+      caption = "Sample size (n), mean diameter growth in inches per year ($\\Delta$dbh), and standard deviation of growth (sd) for species groups in the training data.",
+      escape = FALSE,
+      longtable = FALSE)
+```
+
+Other measures of inter-tree competition have more complex relationships to diameter growth because of interactions with other factors. Plot basal area, like stocking, tends to be negatively correlated to growth, but the relationship is obscured at the ends of the basal area spectrum (figure \ref{fig:baGraph}). Plots with basal areas greater than 400 square feet per acre show a rise in per tree diameter growth because they are all white pine forests (one of the fastest growing species) with relatively large trees, located on productive sites. Very low basal area plots show a marked decrease in per tree diameter growth because they tend to be less productive sites with small trees.
+
+```{r crGraph, fig.cap="\\label{fig:crGraph}Crown ratio and diameter growth of individual trees. Observations are displayed with random vertical and horizontal offset and partial transparency so that their relative concentration can be visualized. Darker areas show a greater concentration of observations. Trend line in blue calculated using generalized additive model.", fig.height=3, fig.width=5}
+
+train %>%
+  ggplot(aes(cr, diam_growth)) +
+  geom_jitter(width = 2.5, height = .005, alpha = .05) +
+  geom_smooth(col = "#386cb0") +
+  scale_y_continuous(limits = c(0, .3),
+                     name = expression(Delta~'dbh (in/yr)')) +
+  scale_x_continuous(name = "crown ratio (% height)") +
+  theme(text = element_text(family = "Perpetua"))
+```
+
+```{r stockGraph, fig.cap="\\label{fig:stockGraph}Plot level forest stocking and diameter growth of individual trees.", fig.height=3, fig.width=5}
+
+train_temp <- train %>%
+  mutate(stocking = factor(stocking),
+         stocking = plyr::revalue(stocking, c("1" = "overstocked",
+                                        "2" = "full",
+                                        "3" = "medium",
+                                        "4" = "poor",
+                                        "5" = "nonstocked")))
+
+
+train_temp %>%
+  ggplot(aes(stocking, diam_growth)) +
+  geom_boxplot(fill = "gray") +
+  scale_y_continuous(limits = c(0, .3),
+                     name = expression(Delta~'dbh (in/yr)')) +
+  scale_x_discrete(name = "stocking level") +
+  theme(text = element_text(family = "Perpetua"))
+```
+
+```{r baGraph, fig.cap="\\label{fig:baGraph}Plot basal area and diameter growth of individual trees. Observations are displayed with random vertical offset and partial transparency so that their relative concentration can be visualized. Darker areas show a greater concentration of observations. Trend line in blue calculated using generalized additive model.", fig.height=3, fig.width=5}
+
+train %>%
+  ggplot(aes(ba, diam_growth)) +
+  geom_jitter(alpha = .07) +
+  geom_smooth(col = "#386cb0") +
+  scale_y_continuous(limits = c(0, .3),
+                     name = expression(Delta~'dbh (in/yr)')) +
+  scale_x_continuous(name = 'plot basal area (sq ft/ac)') +
+  theme(text = element_text(family = "Perpetua"))
+```
+
+Likewise, crown class shows a clear relationship to diameter growth, with more dominant trees growing faster, except that open grown trees are among the slowest growing (figure \ref{fig:crownGraph}). Like with basal area, this results from the fact that open grown trees in the data are disproportionately small. While the mean tree diameter in the data overall is `r round(mean(train$dbh), 2)` inches, among open grown trees it is only `r round(mean(filter(train, crown_class == 1)$dbh), 2)` inches.
+
+```{r crownGraph, fig.cap="\\label{fig:crownGraph}Crown class and diameter growth of individual trees.", fig.height=3, fig.width=5}
+
+train_temp <- train %>%
+  mutate(crown_class = factor(crown_class),
+         crown_class = plyr::revalue(crown_class, c("1" = "open grown",
+                                                    "2" = "dominant",
+                                                    "3" = "codominant",
+                                                    "4" = "intermediate",
+                                                    "5" = "overtopped")))
+
+
+train_temp %>%
+  ggplot(aes(crown_class, diam_growth)) +
+  geom_boxplot(fill = "gray") +
+  scale_y_continuous(limits = c(0, .3),
+                     name = expression(Delta~'dbh (in/yr)')) +
+  scale_x_discrete(name = "crown class") +
+  theme(text = element_text(family = "Perpetua"))
+```
+
+\pagebreak
+
+Another notable interactive effect in the data is seen in the geographic variation of growth rates. On their own, latitude and longitude explain only a very small amount of the variation in diameter growth, with trees in the south growing slightly faster than those in the north, and trees in the east and west growing somewhat faster than mid-longitudinal trees. When latitude and longitude are assessed in tandem, however, a much stronger relationship becomes apparent. The lower Black River valley in the west and the Champlain valley near Vermont clearly have the highest growth rates, while the central Adirondack plateau has the lowest (figure \ref{fig:map}). The Saint Lawrence Valley in the north also shows relatively fast growth rates, but growth is much slower in the northeast part of the region (in Clinton County north of Plattsburgh).
+
+```{r map, fig.cap="\\label{fig:map}Geographic variation in diameter growth, depicted using two dimensional bin smoothing and interpolation.", fig.width=5}
+
+# Cuts continuous var into bins & returns midpoint value:
+cut2 <- function(x, breaks) {
+  r <- range(x)
+  b <- seq(r[1], r[2], length=2*breaks+1)
+  brk <- b[0:breaks*2+1]
+  mid <- b[1:breaks*2]
+  brk[1] <- brk[1]-0.01
+  k <- cut(x, breaks=brk, labels=FALSE)
+  mid[k]
+}
+
+# 2d bin smoothed mapping of diameter growth
+train %>%
+  mutate(groupx = cut2(lon, 10), #binning lat & lon
+         groupy = cut2(lat, 10)) %>%
+  group_by(groupx, groupy) %>%
+  summarize(growth = mean(diam_growth)) %>%
+  ggplot(aes(groupx, groupy)) +
+  geom_raster(aes(fill = growth), interpolate = TRUE) +
+  geom_polygon(data = map_data("state"),
+               aes(x = long, y = lat, group = group),
+               fill = NA, col = "gray 25") +
+  annotate(geom = "text", x = -73.54, y = 44.05, col = "gray 10",
+           label = "Champlain Valley", angle = 90, size = 2.8) +
+  annotate(geom = "text", x = -75.43, y = 43.63, col = "gray 10",
+           label = "Black River Valley", angle = 290, size = 2.8) +
+  annotate(geom = "text", x = -75, y = 44.82, col = "gray 10",
+           label = "St. Lawrence Valley", angle = 28, size = 2.8) +
+  annotate(geom = "text", x = -74.01, y = 44.12, col = "gray 5",
+           label = "High \n Peaks", size = 2.8) +
+  annotate(geom = "text", x = -75.79, y = 43.61, col = "gray 5",
+           label = "Tug \n Hill", size = 2.8) +
+  annotate(geom = "text", x = -73.22, y = 44.74, col = "gray 10",
+           label = "Plattsburgh", size = 2.5) +
+  annotate(geom = "point", x = -73.46, y = 44.66, col = "gray 10",
+           size = 1.5) +
+  scale_fill_viridis_c(option = "plasma", 
+                       name = expression(Delta*'dbh (in/yr)')) +
+  coord_fixed(xlim = c(-76.8, -73), ylim = c(42.4, 45.5), ratio = 1.3) +
+  theme(axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid = element_blank(),
+        text = element_text(family = "Perpetua"))
+```
+
+##Model Formulation
+
+```{r trainNaive}
+
+# calculates RMSE:
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+
+mu <- mean(train$diam_growth)
+
+
+# Train regularization of naive terms --------------------------------------
+
+# regularization params to try for each predictor
+l1 <- seq(0, 10, 2)
+l2 <- seq(0, 10, 2)
+l3 <- seq(0, 10, 2)
+
+ls <- expand.grid(l1, l2, l3)
+
+# K folds for cross validation
+set.seed(10)
+folds <- createFolds(train$diam_growth, k=5, list = FALSE)
+
+# calculate RMSE for each combo of possible params
+rmses <- vector(length = nrow(ls))
+for(i in 1:nrow(ls)){
+
+    res <- vector(length = length(unique(folds)))
+  for(j in 1:length(unique(folds))){
+
+    b_s <- train[folds != j,] %>% 
+      group_by(spp) %>%
+      summarize(b_s = mean(diam_growth - mu)*(n()/(n() + ls[i, 1])))
+    
+    b_f <- train[folds != j,] %>%
+      left_join(b_s, by = "spp") %>%
+      group_by(forest_type) %>%
+      summarize(b_f = mean(diam_growth - mu - b_s)*(n()/(n() + ls[i, 2])))
+    
+    b_l <- train[folds != j,] %>%
+      left_join(b_s, by = "spp") %>%
+      left_join(b_f, by = "forest_type") %>%
+      group_by(landscape) %>%
+      summarize(b_l = mean(diam_growth - mu - b_s - b_f)*(n()/(n() + ls[i, 3])))
+    
+    pred <- train[folds == j,] %>%
+      left_join(b_s, by = "spp") %>%
+      left_join(b_f, by = "forest_type") %>%
+      left_join(b_l, by = "landscape") %>%
+      mutate(b_s = if_else(is.na(b_s), 0, b_s),
+             b_f = if_else(is.na(b_f), 0, b_f),
+             b_l = if_else(is.na(b_l), 0, b_l),
+             pred = mu + b_s + b_f + b_l)
+    
+    res[j] <- RMSE(train$diam_growth[folds == j], pred$pred)
+  }
+
+  rmses[i] <- mean(res)
+}
+
+reg_index <- which.min(rmses)
+
+
+# Record results after each term addition ----------------------------------
+
+results <- data.frame(model = "mu", 
+                      RMSE = RMSE(train$diam_growth, mu))
+
+b_s <- train %>% 
+  group_by(spp) %>%
+  summarize(b_s = mean(diam_growth - mu)*(n()/(n() + ls[reg_index, 1])))
+
+pred <- train %>%
+  left_join(b_s, by = "spp") %>%
+  mutate(b_s = if_else(is.na(b_s), 0, b_s),
+         pred = mu + b_s)
+
+results <- bind_rows(results,
+                     data.frame(model = "mu + bs", 
+                                RMSE = RMSE(train$diam_growth,
+                                            pred$pred)))
+
+b_f <- train %>%
+  left_join(b_s, by = "spp") %>%
+  group_by(forest_type) %>%
+  summarize(b_f = mean(diam_growth - mu - b_s)*(n()/(n() + ls[reg_index, 2])))
+
+pred <- train %>%
+  left_join(b_s, by = "spp") %>%
+  left_join(b_f, by = "forest_type") %>%
+  mutate(b_s = if_else(is.na(b_s), 0, b_s),
+         b_f = if_else(is.na(b_f), 0, b_f),
+         pred = mu + b_s + b_f)
+
+results <- bind_rows(results,
+                     data.frame(model = "mu + bs + bf", 
+                                RMSE = RMSE(train$diam_growth,
+                                            pred$pred)))
+
+b_l <- train %>%
+  left_join(b_s, by = "spp") %>%
+  left_join(b_f, by = "forest_type") %>%
+  group_by(landscape) %>%
+  summarize(b_l = mean(diam_growth - mu - b_s - b_f)*(n()/(n() + ls[reg_index, 3])))
+
+pred <- train %>%
+  left_join(b_s, by = "spp") %>%
+  left_join(b_f, by = "forest_type") %>%
+  left_join(b_l, by = "landscape") %>%
+  mutate(b_s = if_else(is.na(b_s), 0, b_s),
+         b_f = if_else(is.na(b_f), 0, b_f),
+         b_l = if_else(is.na(b_l), 0, b_l),
+         pred = mu + b_s + b_f + b_l)
+
+results <- bind_rows(results,
+                     data.frame(model = "mu + bs + bf + bl", 
+                                RMSE = RMSE(train$diam_growth,
+                                            pred$pred)))
+```
+
+Two different approaches were combined to construct the diameter growth model. A naive Bayes approach was used to modify the mean diameter growth ($\mu$) by the average growth residuals for individual categories in the categorical predictors. This sub-model included terms for the simple effects of species grouping ($b_{s}$), forest type ($b_{f}$), and landscape position ($b_{l}$). Regularization was used on the three simple effects to downgrade the strength of any effects trained on small sample sizes. Optimal regularization parameters $\lambda_s$, $\lambda_f$, and $\lambda_l$ were determined for each effect, respectively, using k-fold cross validation to prevent overfitting. Simple effect terms took the form $$b_j=\frac{\sum_{i=0}^{n_j}(\Delta dbh_{ji}-\mu)}{n_j+\lambda}$$ where $b_j$ is the effect for category $j$, $i$ is the individual growth observation, $n$ is the sample size, $\Delta dbh$ is the diameter growth rate, $\mu$ is the mean growth rate across all the data, and $\lambda$ is the regularization parameter. The optimal regularization parameters were determined to be `r ls[reg_index, 1]`, `r ls[reg_index, 2]`, and `r ls[reg_index, 3]`, respectively.
+
+To account for interactions between quantitative variables, a random forest algorithm was fitted to the residual growth rates after applying all the simple terms. Discrete ordinal factors (site class, stocking, and crown class) were treated as numeric predictors. Other predictors included slope, aspect, basal area, latitude, longitude, crown ratio, and dbh. Accuracy was greatly reduced when categorical variables (species, forest type, and landscape position) were included in the random forest, so they were excluded. The forest was made up of 200 regression trees, and the minimum node size was determined using k-fold cross validation on the training data.
+
+```{r trainRF}
+
+# New training set with residuals from naive model -------------------------
+
+train2 <- train %>%
+  mutate(resid = diam_growth - pred$pred) %>%
+  select(-spp, -forest_type, -landscape, -county, -diam_growth) %>%
+  select(resid, everything())
+
+# Fit RF to training data --------------------------------------------------
+# This may take up to an hour
+
+set.seed(10)
+fit_rf <- train(resid ~ ., data = train2, method = "Rborist", nTree = 200,
+                tuneGrid = data.frame(predFixed = 2, minNode = seq(2, 18, by = 4)))
+
+# Final predictions on training data ---------------------------------------
+pred <- train %>%
+  left_join(b_s, by = "spp") %>%
+  left_join(b_f, by = "forest_type") %>%
+  left_join(b_l, by = "landscape") %>%
+  mutate(b_s = if_else(is.na(b_s), 0, b_s),
+         b_f = if_else(is.na(b_f), 0, b_f),
+         b_l = if_else(is.na(b_l), 0, b_l),
+         rf = predict(fit_rf, newdata = train),
+         pred = mu + b_s + b_f + b_l + rf)
+
+results <- bind_rows(results,
+                     data.frame(model = "mu + bs + bf + bl + rf", 
+                                RMSE = RMSE(train$diam_growth, pred$pred)))
+```
+
+The final model can be expressed as $$\Delta dbh=\mu+b_s+b_f+b_l+rf+\epsilon$$ where $rf$ is the random forest effect, $\epsilon$ is an error term, and other variables have been defined previously. 
+
+The model was parameterized using the training data alone, and the overall accuracy was estimated using the test data that had been set aside previously. Finally, the model was refit to all the available data (training and test sets combined), using the pre-determined parameters. 
+
+#Results
+
+The overall mean diameter growth rate $\mu$ is `r round(mu, 4)` inches per year, and simply predicting the mean for every instance yields a root mean square error (RMSE) of `r round(results[1,2], 4)` inches per year. Accounting for the simple effects of categorical variables yields moderate decreases in RMSE. Accounting for species group reduces the RMSE to `r round(results[2,2], 4)` inches per year; accounting for species and forest type reduces it to `r round(results[3,2], 4)` inches per year; and accounting for species, forest type, and landscape position reduces it to `r round(results[4,2], 4)` inches per year.
+
+The random forest brings significant gains to the model's accuracy, lowering the RMSE (evaluated with the training data alone) to `r round(results[5,2], 4)` inches per year. Results from the training show that, of the numeric predictors, dbh is by far the most important, followed by plot basal area and crown ratio. Latitude and longitude together are similar in importance to either one of the competition indicies above, while slope, aspect, stocking, site class, and crown class are less important. Variable importance values for these predictors are reported in table 2.
+
+```{r varImp, results="asis"}
+
+v_i <- data.frame(predictor = c("site class", "slope", "aspect", 
+                                "basal area", "latitude", "longitude", 
+                                "crown ratio", "dbh",
+                                "stocking", "crown class"),
+                  importance = varImp(fit_rf)$importance$Overall) %>%
+  arrange(desc(importance))
+
+kable(v_i,
+      digits = 2,
+      caption = "Variable importance of numeric predictors in random forest model.")
+```
+
+```{r test}
+##############################
+# Estimate accuracy of final
+##############################
+
+
+pred_final <- test %>%
+  left_join(b_s, by = "spp") %>%
+  left_join(b_f, by = "forest_type") %>%
+  left_join(b_l, by = "landscape") %>%
+  mutate(b_s = if_else(is.na(b_s), 0, b_s),
+         b_f = if_else(is.na(b_f), 0, b_f),
+         b_l = if_else(is.na(b_l), 0, b_l),
+         rf = predict(fit_rf, newdata = test),
+         pred = mu + b_s + b_f + b_l + rf,
+         error = diam_growth - pred)
+
+RMSE_final <- RMSE(pred_final$diam_growth, pred_final$pred)
+```
+
+**When tested against the independent testing data, the overall model returns a RMSE of `r round(RMSE_final, 4)` inches per year.**
+
+```{r errorDist, fig.cap="\\label{fig:errorDist}Kernel density estimate of error distribution of final model, fit to test data. Negative errors are overpredictions.", fig.height=3, fig.width=4.5}
+
+pred_final %>% ggplot(aes(error)) +
+  geom_density(bw = .008, fill = "dark gray") +
+  xlab("error (in/year)") +
+  theme(text = element_text(family = "Perpetua"))
+```
+
+Errors are narrowly distributed around 0 (figure \ref{fig:errorDist}), showing that the model is unbiased for the Adirondack region as a whole. Predictions are also unbiased for many species groups, although several do show limited bias (figure \ref{fig:sppErr}). The most notable are white and red oak, whose growth rates are overpredicted by approximately `r round(abs(mean(filter(pred_final, spp == "white oak")$error)), 3)` and `r round(abs(mean(filter(pred_final, spp == "red oak")$error)), 3)` inches per year, respectively. Predictions are much less biased for more common species. Absolute mean error rates for the ten most common species groups in the region (soft maple, beech, hard maple, fir, spruce, yellow birch, hemlock, ash, white pine, and black cherry) are all less than 0.005 inches per year, with the exception of hard maple, whose growth rates were overpredicted by an average of `r round(abs(mean(filter(pred_final, spp == "hard maple")$error)), 3)` inches per year.
+
+```{r sppErr, fig.cap="\\label{fig:sppErr}Kernal density estimates of error distributions for individual species groups. Vertical blue lines show 0 (no error) and vertical brown lines show species groups' average errors. Negative errors are overpredictions. No cottonwoods were present in the testing data, so they have been omitted.", fig.height=8, fig.width=6.5}
+
+pred_final %>% 
+  group_by(spp) %>%
+  mutate(xint = mean(error)) %>%
+  ungroup() %>%
+  ggplot(aes(error)) +
+  geom_density(bw = .008, fill = "dark gray") +
+  geom_vline(xintercept = 0, col = "#386cb0", size = 1) +
+  geom_vline(aes(xintercept = xint), col = "#bf5b17", size = 1) +
+  facet_wrap(~ spp, ncol = 4) +
+  scale_x_continuous(name = "error (in/yr)",
+                     breaks = c(-0.1, 0, 0.1),
+                     limits = c(-0.1, 0.1)) +
+  theme(text = element_text(family = "Perpetua"))
+```
+
+#Conclusions
+
+This model does appear to have increased the accuracy of diameter growth predictions in the Adirondacks over previous models. Its normalized RMSE ($RMSE/\mu$) of `r round(RMSE_final/mu, 3)` compares favorably with the species-specific normalized RMSEs from @weiskittel_development_2016, which range from 0.48 (hemlock) to 0.73 (other hardwoods) and average 0.61. The reduction is probably partly to do with the larger, more representative dataset used here, but there do appear to be significant gains made by modeling the interactions between numeric predictors, which were neglected in previous studies. These interactions are clearly important in the Adirondack's structurally diverse, mixed species forests, and help to account for geographic variation in growth trends.
+
+The model also improves on species-specific bias, with absolute mean biases below 0.005 inches per year for all but one of the ten of the most common species. @weiskittel_development_2016 report absolute mean biases for the ten common species that range from 0.002 to 0.019 inches per year and average 0.010 inches per year.
+
+It is clear from this study and from other studies in the Northeast that dbh and species are two of the most important predictors of diameter growth. Inter-tree competition can also explain some of the variability in growth rates, though different studies in the region disagree on the best metrics to use. @teck_individual_1991 and @weiskittel_development_2016 favored overtopping basal area, which was not used in this study, but could have been incorporated. @kiernan_individual-tree_2008 found that tree-specific measures of competition were not useful and used plot-level basal area alone to describe the effects of competition. Crown ratio was an important competition index in this model and for @westfall_predicting_2006, yet @kiernan_individual-tree_2008 and @weiskittel_development_2016 rejected the measure as superfluous. Perhaps as models grow more sophisticated at assessing the interactions between variables we will gain a more nuanced understanding of how competition indices overlap and where they stand on their own. 
+
+In this model, it seemed that one tree-specific index (crown ratio) and one plot-level index (basal area) were enough to account for the bulk of the competition-related variability, and that the remaining indices (crown class and stocking) were mostly redundant. This makes intuitive sense, as the tree-level and plot-level metrics describe fundamentally different attributes. Plot-level metrics like basal area and stocking describe a tree's access to external resources (light and water, for example), while tree-level metrics like crown ratio describe a tree's internal resources (the size of its growth engine). 
+
+Basal area, latitude, and longitude were the only plot-level factors that contributed meaningfully to growth predictions. The effects of landscape position, forest type, aspect, slope, and site class were minimal. In aggregate, those factors bring a marginal improvement to the model's accuracy, but they could be removed from the analysis to save on inventory costs without a significant impact.
+
+Potential improvements to the model include the incorporation of other predictors like overtopping basal area, which could be derived from the available data, and an incorporation of interactions between categorical and numeric predictors (especially between species and dbh). Different algorithms or different formulations of the random forest algorithm may do a better job incorporating categorical and numeric variables, which could improve the model's accuracy and streamline the prediction process. The model used here does benefit from fast prediction, though, which is especially important for use in regular forest planning. A k-nearest neighbor algorithm would probably be more accurate and much faster to train, for example, but it would be slow to make predictions with, making it a poor choice.
+
+Perhaps the greatest detriment of this model is its lack of transparency and portability. Previous models can be expressed using equations with species-specific coefficients, and are easily reproduced by foresters with a working knowledge of any spreadsheet program. The random forest algorithm, on the other hand, cannot be expressed as a simple formula and will be inaccessible to many working foresters. Foresters who do already work in R can obtain the code from GitHub^[https://github.com/nealmaker/adk-growth] and incorporate the model into their workflows. 
+
+While opaque, the random forest algorithm offers many benefits for growth modeling. It is non-parametric, and does not depend on any assumptions about the distributions of the various factors. This is a major benefit when working with forestland attributes, which often have skewed distributions and some of which have poorly understood distributions. Also, the random forest does not presuppose the forms which growth relationships will take. It builds the optimal forms itself based on the data, limiting the bias introduced by humans. 
+
+This latter point is both a blessing and a curse. By being purely empirical, non-parametric models like the random forest can limit bias and increase accuracy, but they also limit the model's ability to extrapolate. Models that fail to capture the underlying processes in forest growth are poorly suited for predicting growth in novel scenarios. This model is well suited to predicting the growth of Adirondack trees over relatively short time scales, but it is inappropriate for modeling the effects of climate change on growth, or for modeling the outcomes of new management systems.
+
+#References
